@@ -1,0 +1,10 @@
+[package]
+name = "enclose-strings"
+version = "0.1.0"
+edition = "2021"
+description = "Wrap or enclose strings in matching or complementary characters with optional escaping"
+repository = "https://github.com/neilg63/enclose-strings"
+categories = ["text-processing", "parsing"]
+license = "MIT"
+
+[dependencies]
