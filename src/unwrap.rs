@@ -269,20 +269,52 @@ pub trait SimpleExtract: AsRef<str> {
             })
     }
 
-    /// The first argument list bounded by `opening` and its matching closing
-    /// character, treating quoted regions as opaque and tracking nesting.
+    /// The first balanced enclosure bounded by `opening` and its matching
+    /// closing character, treating quoted regions as opaque and tracking
+    /// nesting.
     ///
     /// ```
     /// # use enclose_strings::SimpleExtract;
     /// let call = r#"add_title("Latest Stats (2024-2025)", "en-GB")"#;
     /// assert_eq!(
-    ///     call.extract_arguments('('),
+    ///     call.extract_balanced('('),
     ///     Some(r#""Latest Stats (2024-2025)", "en-GB""#.to_string())
     /// );
     /// ```
+    fn extract_balanced(&self, opening: char) -> Option<String> {
+        self.extract_nth_balanced(opening, 0)
+    }
+
+    /// Backward-compatible alias for [`SimpleExtract::extract_balanced`].
     fn extract_arguments(&self, opening: char) -> Option<String> {
-        let closing = match_closing_char(opening);
-        self.extract_first_enclosure_with(opening, closing, ScanOptions::quoted())
+        self.extract_balanced(opening)
+    }
+
+    /// The *n*th balanced enclosure (0-indexed) bounded by `opening` and its
+    /// matching closing character, treating quoted regions as opaque and
+    /// tracking nesting.
+    fn extract_nth_balanced(&self, opening: char, n: usize) -> Option<String> {
+        self.extract_captures(opening)
+            .into_iter()
+            .filter_map(|seg| match seg {
+                CapturedSegment::Enclosure(content) => Some(content.into_owned()),
+                CapturedSegment::Outside(_) => None,
+            })
+            .nth(n)
+    }
+
+    /// Every balanced enclosure content bounded by `opening` and its matching
+    /// closing character, treating quoted regions as opaque and tracking
+    /// nesting. Returns only the content strings, discarding the text
+    /// between enclosures.
+    fn extract_all_balanced(&self, opening: char) -> Vec<String> {
+        self.extract_captures(opening)
+            .into_iter()
+            .filter_map(|seg| match seg {
+                CapturedSegment::Enclosure(content) => Some(content.into_owned()),
+                CapturedSegment::Outside(_) => None,
+            })
+            .collect()
     }
 
     /// Every enclosure bounded by `opening` and its matching closing
@@ -299,11 +331,16 @@ pub trait SimpleExtract: AsRef<str> {
         )
     }
 
-    /// As [`SimpleExtract::extract_segments`], but treating quoted regions as
-    /// opaque and tracking nesting, for delimiters bounding an argument list.
-    fn extract_quoted_segments(&self, opening: char) -> Vec<CapturedSegment<'_>> {
+    /// Split the string into alternating enclosures and outside text,
+    /// treating quoted regions as opaque and tracking nesting.
+    fn extract_captures(&self, opening: char) -> Vec<CapturedSegment<'_>> {
         let closing = match_closing_char(opening);
         self.extract_enclosures_with(opening, closing, ScanOptions::quoted())
+    }
+
+    /// Backward-compatible alias for [`SimpleExtract::extract_captures`].
+    fn extract_quoted_segments(&self, opening: char) -> Vec<CapturedSegment<'_>> {
+        self.extract_captures(opening)
     }
 
     /// The first enclosure, ignoring the text around it.
@@ -324,13 +361,36 @@ pub trait SimpleExtract: AsRef<str> {
             })
     }
 
-    /// Every enclosure in the string, discarding the text around them.
+    /// Every balanced enclosure in the string at every nesting depth,
+    /// ordered by opening position (outermost groups appear first when
+    /// they start before their children).
+    ///
+    /// When the opening and closing characters differ, nesting is tracked
+    /// so `((a or b) and (c or d))` yields all three groups rather than
+    /// stopping at the first `)`.  When they are identical (e.g. `"`),
+    /// nesting is impossible and the method falls back to a flat scan.
     fn extract_all_enclosed(&self, opening: char) -> Vec<String> {
         let closing = match_closing_char(opening);
-        self.extract_enclosures(opening, closing, EscapeStyle::Char('\\'))
-            .iter()
-            .filter_map(|segment| segment.enclosure().map(|text| text.to_string()))
-            .collect()
+        if opening == closing {
+            return self
+                .extract_enclosures(opening, closing, EscapeStyle::Char('\\'))
+                .iter()
+                .filter_map(|segment| segment.enclosure().map(|text| text.to_string()))
+                .collect();
+        }
+        let s = self.as_ref();
+        let mut results: Vec<(usize, String)> = Vec::new();
+        let mut stack: Vec<usize> = Vec::new();
+        for (idx, ch) in s.char_indices() {
+            if ch == opening {
+                stack.push(idx + ch.len_utf8());
+            } else if ch == closing && !stack.is_empty() {
+                let content_start = stack.pop().unwrap();
+                results.push((content_start, s[content_start..idx].to_string()));
+            }
+        }
+        results.sort_by_key(|(pos, _)| *pos);
+        results.into_iter().map(|(_, content)| content).collect()
     }
 
     /// Extract the first enclosure, treating the content literally
@@ -376,6 +436,21 @@ pub trait SimpleExtract: AsRef<str> {
     /// the same code point, so contractions open a group.
     fn extract_from_single_quotes(&self) -> Option<String> {
         self.extract_enclosed('\'')
+    }
+
+    /// All captures from parentheses `( )`, with nesting and quoted regions.
+    fn extract_all_from_parentheses(&self) -> Vec<CapturedSegment<'_>> {
+        self.extract_captures('(')
+    }
+
+    /// All captures from brackets `[ ]`, with nesting and quoted regions.
+    fn extract_all_from_brackets(&self) -> Vec<CapturedSegment<'_>> {
+        self.extract_captures('[')
+    }
+
+    /// All captures from braces `{ }`, with nesting and quoted regions.
+    fn extract_all_from_braces(&self) -> Vec<CapturedSegment<'_>> {
+        self.extract_captures('{')
     }
 }
 
@@ -852,6 +927,7 @@ mod tests {
 
     #[test]
     fn test_extract_all_enclosed() {
+        // flat (non-nested) case is unchanged
         assert_eq!(
             "a(one)b(two)c".extract_all_enclosed('('),
             vec!["one".to_string(), "two".to_string()]
@@ -859,6 +935,78 @@ mod tests {
         assert_eq!(
             "nothing here".extract_all_enclosed('('),
             Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_extract_all_enclosed_nested_parentheses() {
+        assert_eq!(
+            "((a or b) and (c or d))".extract_all_enclosed('('),
+            vec![
+                "(a or b) and (c or d)".to_string(),
+                "a or b".to_string(),
+                "c or d".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_extract_all_enclosed_nested_brackets() {
+        assert_eq!(
+            "[[a or b] and [c or d]]".extract_all_enclosed('['),
+            vec![
+                "[a or b] and [c or d]".to_string(),
+                "a or b".to_string(),
+                "c or d".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_extract_all_enclosed_deeply_nested() {
+        assert_eq!(
+            "(a(b(c)))".extract_all_enclosed('('),
+            vec![
+                "a(b(c))".to_string(),
+                "b(c)".to_string(),
+                "c".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_extract_all_enclosed_mixed_depths() {
+        // two top-level groups, one of which has nesting
+        assert_eq!(
+            "(a)(b(c)d)".extract_all_enclosed('('),
+            vec![
+                "a".to_string(),
+                "b(c)d".to_string(),
+                "c".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_extract_all_enclosed_identical_delimiters_flat() {
+        // quotes can't nest, so the flat scan is used
+        assert_eq!(
+            r#""one" and "two""#.extract_all_enclosed('"'),
+            vec!["one".to_string(), "two".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_extract_all_enclosed_unmatched_ignored() {
+        // unmatched closing brackets are skipped
+        assert_eq!(
+            ")extra(content)".extract_all_enclosed('('),
+            vec!["content".to_string()]
+        );
+        // unclosed opening brackets produce nothing for that group
+        assert_eq!(
+            "(closed)(unclosed".extract_all_enclosed('('),
+            vec!["closed".to_string()]
         );
     }
 
@@ -887,10 +1035,10 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_quoted_segments_defaults() {
+    fn test_extract_captures() {
         let call = r#"add_title("Latest Stats (2024-2025)", "en-GB")"#;
         assert_eq!(
-            call.extract_quoted_segments('('),
+            call.extract_captures('('),
             vec![
                 CapturedSegment::Outside("add_title"),
                 CapturedSegment::Enclosure(Cow::Borrowed(r#""Latest Stats (2024-2025)", "en-GB""#)),
@@ -898,10 +1046,106 @@ mod tests {
         );
         // nesting is tracked as well as quoting
         assert_eq!(
-            "f(g(x), y)".extract_quoted_segments('('),
+            "f(g(x), y)".extract_captures('('),
             vec![
                 CapturedSegment::Outside("f"),
                 CapturedSegment::Enclosure(Cow::Owned("g(x), y".to_string())),
+            ]
+        );
+        // backward-compat alias agrees
+        assert_eq!(
+            "f(g(x), y)".extract_quoted_segments('('),
+            "f(g(x), y)".extract_captures('('),
+        );
+    }
+
+    #[test]
+    fn test_extract_balanced() {
+        let call = r#"add_title("Latest Stats (2024-2025)", "en-GB")"#;
+        assert_eq!(
+            call.extract_balanced('('),
+            Some(r#""Latest Stats (2024-2025)", "en-GB""#.to_string())
+        );
+        // backward-compat alias agrees
+        assert_eq!(
+            call.extract_arguments('('),
+            call.extract_balanced('('),
+        );
+    }
+
+    #[test]
+    fn test_extract_nth_balanced() {
+        let input = "f(a, b) + g(c, d)";
+        assert_eq!(input.extract_nth_balanced('(', 0), Some("a, b".to_string()));
+        assert_eq!(input.extract_nth_balanced('(', 1), Some("c, d".to_string()));
+        assert_eq!(input.extract_nth_balanced('(', 2), None);
+        // nested brackets are balanced
+        assert_eq!(
+            "f(g(x), y) + h(z)".extract_nth_balanced('(', 0),
+            Some("g(x), y".to_string())
+        );
+        assert_eq!(
+            "f(g(x), y) + h(z)".extract_nth_balanced('(', 1),
+            Some("z".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_all_balanced() {
+        let input = "f(a, b) + g(c, d)";
+        assert_eq!(
+            input.extract_all_balanced('('),
+            vec!["a, b".to_string(), "c, d".to_string()]
+        );
+        // nesting is balanced: outer content includes inner brackets
+        assert_eq!(
+            "f(g(x), y) + h(z)".extract_all_balanced('('),
+            vec!["g(x), y".to_string(), "z".to_string()]
+        );
+        // quoted closing delimiters are skipped
+        let call = r#"f("a)", b) + g("c")"#;
+        assert_eq!(
+            call.extract_all_balanced('('),
+            vec![r#""a)", b"#.to_string(), r#""c""#.to_string()]
+        );
+    }
+
+    #[test]
+    fn test_extract_all_from_parentheses() {
+        let input = "f(a, b) + g(c, d)";
+        assert_eq!(
+            input.extract_all_from_parentheses(),
+            vec![
+                CapturedSegment::Outside("f"),
+                CapturedSegment::Enclosure(Cow::Borrowed("a, b")),
+                CapturedSegment::Outside(" + g"),
+                CapturedSegment::Enclosure(Cow::Borrowed("c, d")),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_extract_all_from_brackets() {
+        assert_eq!(
+            "a[0] + b[1]".extract_all_from_brackets(),
+            vec![
+                CapturedSegment::Outside("a"),
+                CapturedSegment::Enclosure(Cow::Borrowed("0")),
+                CapturedSegment::Outside(" + b"),
+                CapturedSegment::Enclosure(Cow::Borrowed("1")),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_extract_all_from_braces() {
+        assert_eq!(
+            "a{x} + b{y}".extract_all_from_braces(),
+            vec![
+                CapturedSegment::Outside("a"),
+                CapturedSegment::Enclosure(Cow::Borrowed("x")),
+                CapturedSegment::Outside(" + b"),
+                CapturedSegment::Enclosure(Cow::Borrowed("y")),
             ]
         );
     }
@@ -1044,10 +1288,10 @@ mod tests {
     // --- quoted regions and nesting ---------------------------------------
 
     #[test]
-    fn test_extract_arguments_skips_quoted_closing_delimiter() {
+    fn test_extract_balanced_skips_quoted_closing_delimiter() {
         let call = r#"add_title("Latest Stats (2024-2025)", "en-GB")"#;
         assert_eq!(
-            call.extract_arguments('('),
+            call.extract_balanced('('),
             Some(r#""Latest Stats (2024-2025)", "en-GB""#.to_string())
         );
     }
@@ -1056,11 +1300,11 @@ mod tests {
     fn test_quoted_region_beats_nesting() {
         let call = r#"add_title("Smiley :)", "en")"#;
         assert_eq!(
-            call.extract_arguments('('),
+            call.extract_balanced('('),
             Some(r#""Smiley :)", "en""#.to_string())
         );
         assert_eq!(
-            r#"f("a (b", "c")"#.extract_arguments('('),
+            r#"f("a (b", "c")"#.extract_balanced('('),
             Some(r#""a (b", "c""#.to_string())
         );
     }
@@ -1068,11 +1312,11 @@ mod tests {
     #[test]
     fn test_balanced_nesting() {
         assert_eq!(
-            "f(g(x), y)".extract_arguments('('),
+            "f(g(x), y)".extract_balanced('('),
             Some("g(x), y".to_string())
         );
         assert_eq!(
-            "outer(a(b(c)), d)".extract_arguments('('),
+            "outer(a(b(c)), d)".extract_balanced('('),
             Some("a(b(c)), d".to_string())
         );
         assert_eq!(
@@ -1085,7 +1329,7 @@ mod tests {
     fn test_escaped_quote_inside_a_quoted_region() {
         let call = r#"f("say \"hi\" now", "x")"#;
         assert_eq!(
-            call.extract_arguments('('),
+            call.extract_balanced('('),
             Some(r#""say \"hi\" now", "x""#.to_string())
         );
     }
@@ -1093,11 +1337,11 @@ mod tests {
     #[test]
     fn test_single_and_double_quotes_both_recognised() {
         assert_eq!(
-            r#"f('a )b', "c )d")"#.extract_arguments('('),
+            r#"f('a )b', "c )d")"#.extract_balanced('('),
             Some(r#"'a )b', "c )d""#.to_string())
         );
         assert_eq!(
-            r#"f("it's fine)")"#.extract_arguments('('),
+            r#"f("it's fine)")"#.extract_balanced('('),
             Some(r#""it's fine)""#.to_string())
         );
     }
@@ -1126,13 +1370,13 @@ mod tests {
 
     #[test]
     fn test_unterminated_quote_leaves_the_enclosure_unclosed() {
-        assert_eq!(r#"f("never closed)"#.extract_arguments('('), None);
+        assert_eq!(r#"f("never closed)"#.extract_balanced('('), None);
     }
 
     #[test]
     fn test_two_stage_call_parse() {
         let call = r#"add_title("Latest Stats (2024-2025)", "en-GB")"#;
-        let args = call.extract_arguments('(').expect("argument list");
+        let args = call.extract_balanced('(').expect("balanced enclosure");
         assert_eq!(args, r#""Latest Stats (2024-2025)", "en-GB""#);
         assert_eq!(
             args.extract_all_enclosed('"'),
